@@ -1,6 +1,14 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { joinRoom } from 'trystero/nostr';
-import { get, set } from 'idb-keyval';
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import {
+  getDatabase,
+  ref,
+  set as fbSet,
+  onValue,
+  remove,
+  update,
+} from 'firebase/database';
+import { get as idbGet, set as idbSet } from 'idb-keyval';
 import { QRCodeSVG } from 'qrcode.react';
 import confetti from 'canvas-confetti';
 import {
@@ -12,7 +20,23 @@ import {
   CheckCircle2,
   RefreshCw,
   Download,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyADzQWBW8q2BU5uU-ZL_CefvYedjZrPE28",
+  authDomain: "meetup-draw-3b7b7.firebaseapp.com",
+  databaseURL: "https://meetup-draw-3b7b7-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "meetup-draw-3b7b7",
+  storageBucket: "meetup-draw-3b7b7.firebasestorage.app",
+  messagingSenderId: "146187800604",
+  appId: "1:146187800604:web:cb626b0ac6ce2934338fd9",
+  measurementId: "G-5NX8XPK50P"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
 
 interface Participant {
   id: string;
@@ -29,13 +53,12 @@ interface Poll {
   votes: Record<string, number>;
 }
 
-const APP_ID = 'meetup-local-first-draw-v3';
-const NOSTR_RELAYS = [
-  'wss://relay.damus.io',
-  'wss://nos.lol',
-  'wss://relay.nostr.band',
-  'wss://nostr.wine',
-];
+const DEFAULT_POLL: Poll = {
+  active: false,
+  question: 'Which topic should we cover next meetup?',
+  options: ['AI & Local LLMs', 'WebAssembly & Rust', 'System Design', 'DevOps & Cloud'],
+  votes: {},
+};
 
 function downloadCSV(filename: string, rows: string[][]) {
   const csvContent = rows
@@ -67,20 +90,16 @@ export default function App() {
   });
 
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [poll, setPoll] = useState<Poll>({
-    active: false,
-    question: 'Which topic should we cover next meetup?',
-    options: ['AI & Local LLMs', 'WebAssembly & Rust', 'System Design', 'DevOps & Cloud'],
-    votes: {},
-  });
+  const [poll, setPoll] = useState<Poll>(DEFAULT_POLL);
   const [activeTab, setActiveTab] = useState<'raffle' | 'poll'>('raffle');
   const [isDrawing, setIsDrawing] = useState(false);
   const [highlightedName, setHighlightedName] = useState<string | null>(null);
   const [currentWinner, setCurrentWinner] = useState<Participant | null>(null);
-  const [peerCount, setPeerCount] = useState(0);
+  const [isConnected, setIsConnected] = useState(false);
+  const [dbError, setDbError] = useState<string | null>(null);
 
-  const [draftQuestion, setDraftQuestion] = useState(poll.question);
-  const [draftOptions, setDraftOptions] = useState(poll.options.join('\n'));
+  const [draftQuestion, setDraftQuestion] = useState(DEFAULT_POLL.question);
+  const [draftOptions, setDraftOptions] = useState(DEFAULT_POLL.options.join('\n'));
 
   const [participantId] = useState(() => {
     let id = localStorage.getItem('participant_id');
@@ -93,129 +112,134 @@ export default function App() {
   const [nameInput, setNameInput] = useState(() => localStorage.getItem('p_name') || '');
   const [handleInput, setHandleInput] = useState(() => localStorage.getItem('p_handle') || '');
   const [joined, setJoined] = useState(false);
-  const [hostPoll, setHostPoll] = useState<Poll | null>(null);
   const [myVote, setMyVote] = useState<number | null>(null);
-  const [connectedToHost, setConnectedToHost] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
 
-  const sendJoinRef = useRef<any>(null);
-  const sendVoteRef = useRef<any>(null);
-  const broadcastStateRef = useRef<any>(null);
-  const pollRef = useRef<Poll>(poll);
-  pollRef.current = poll;
+  // Monitor Firebase connection status
+  useEffect(() => {
+    const connectedRef = ref(db, '.info/connected');
+    const unsub = onValue(connectedRef, (snap) => {
+      setIsConnected(Boolean(snap.val()));
+    });
+    return () => unsub();
+  }, []);
 
+  // Load local-first IndexedDB cache immediately on Host boot
   useEffect(() => {
     if (isParticipant) return;
-    get('meetup_participants').then((data) => {
-      if (data) setParticipants(data);
+    idbGet(`meetup_participants_${roomId}`).then((cached) => {
+      if (Array.isArray(cached) && cached.length > 0) setParticipants(cached);
     });
-    get('meetup_poll').then((data) => {
-      if (data) {
-        setPoll(data);
-        setDraftQuestion(data.question);
-        setDraftOptions(data.options.join('\n'));
+    idbGet(`meetup_poll_${roomId}`).then((cached) => {
+      if (cached) {
+        setPoll(cached);
+        setDraftQuestion(cached.question || DEFAULT_POLL.question);
+        setDraftOptions((cached.options || DEFAULT_POLL.options).join('\n'));
       }
     });
-  }, [isParticipant]);
+  }, [isParticipant, roomId]);
 
+  // Subscribe to Firebase Realtime Database for Room Participants & Poll
   useEffect(() => {
-    if (isParticipant) return;
-    set('meetup_participants', participants);
-  }, [participants, isParticipant]);
-
-  useEffect(() => {
-    if (isParticipant) return;
-    set('meetup_poll', poll);
-    if (broadcastStateRef.current) {
-      broadcastStateRef.current({ poll });
-    }
-  }, [poll, isParticipant]);
-
-  useEffect(() => {
-    const room = joinRoom({ appId: APP_ID, relayUrls: NOSTR_RELAYS }, roomId);
-    const [sendJoin, getJoin] = room.makeAction('join');
-    const [sendVote, getVote] = room.makeAction('vote');
-    const [broadcastState, getState] = room.makeAction('state');
-
-    sendJoinRef.current = sendJoin;
-    sendVoteRef.current = sendVote;
-    broadcastStateRef.current = broadcastState;
-
-    room.onPeerJoin((peerId) => {
-      setPeerCount((c) => c + 1);
-      if (isParticipant) {
-        setConnectedToHost(true);
-        const savedName = localStorage.getItem('p_name');
-        const savedHandle = localStorage.getItem('p_handle');
-        if (savedName) {
-          sendJoin({ id: participantId, name: savedName, handle: savedHandle || '' }, peerId);
+    const participantsRef = ref(db, `rooms/${roomId}/participants`);
+    const unsubParticipants = onValue(
+      participantsRef,
+      (snapshot) => {
+        setDbError(null);
+        const val = snapshot.val();
+        if (!val) {
+          setParticipants([]);
+          if (!isParticipant) idbSet(`meetup_participants_${roomId}`, []);
+          return;
         }
-      } else {
-        broadcastState({ poll: pollRef.current }, peerId);
+        const list: Participant[] = Object.values(val);
+        list.sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
+        setParticipants(list);
+        if (!isParticipant) {
+          idbSet(`meetup_participants_${roomId}`, list);
+        } else if (val[participantId]) {
+          setJoined(true);
+        }
+      },
+      (err) => {
+        setDbError(err.message);
       }
-    });
+    );
 
-    room.onPeerLeave(() => {
-      setPeerCount((c) => Math.max(0, c - 1));
-    });
-
-    if (!isParticipant) {
-      getJoin((data: any) => {
-        setParticipants((prev) => {
-          const exists = prev.find((p) => p.id === data.id);
-          if (exists) {
-            return prev.map((p) =>
-              p.id === data.id ? { ...p, name: data.name, handle: data.handle } : p
-            );
-          }
-          return [
-            ...prev,
-            {
-              id: data.id,
-              name: data.name,
-              handle: data.handle,
-              hasWon: false,
-              joinedAt: Date.now(),
-            },
-          ];
-        });
-      });
-
-      getVote((data: any) => {
-        setPoll((prev) => ({
-          ...prev,
-          votes: { ...prev.votes, [data.participantId]: data.optionIndex },
-        }));
-      });
-    } else {
-      getState((data: any) => {
-        setConnectedToHost(true);
-        if (data.poll) setHostPoll(data.poll);
-      });
-    }
+    const pollRef = ref(db, `rooms/${roomId}/poll`);
+    const unsubPoll = onValue(
+      pollRef,
+      (snapshot) => {
+        const val = snapshot.val();
+        if (!val) {
+          setPoll((prev) => ({ ...prev, active: false, votes: {} }));
+          return;
+        }
+        const loadedPoll: Poll = {
+          active: Boolean(val.active),
+          question: val.question || DEFAULT_POLL.question,
+          options: Array.isArray(val.options) ? val.options : DEFAULT_POLL.options,
+          votes: val.votes || {},
+        };
+        setPoll(loadedPoll);
+        if (!isParticipant) {
+          idbSet(`meetup_poll_${roomId}`, loadedPoll);
+        } else if (loadedPoll.votes[participantId] !== undefined) {
+          setMyVote(loadedPoll.votes[participantId]);
+        } else {
+          setMyVote(null);
+        }
+      },
+      (err) => {
+        setDbError(err.message);
+      }
+    );
 
     return () => {
-      room.leave();
+      unsubParticipants();
+      unsubPoll();
     };
   }, [roomId, isParticipant, participantId]);
 
-  const handleParticipantSubmit = (e: React.FormEvent) => {
+  // Participant Handlers
+  const handleParticipantSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!nameInput.trim()) return;
-    localStorage.setItem('p_name', nameInput.trim());
-    localStorage.setItem('p_handle', handleInput.trim());
-    sendJoinRef.current?.({
-      id: participantId,
-      name: nameInput.trim(),
-      handle: handleInput.trim(),
-    });
-    setJoined(true);
+    if (!nameInput.trim() || submitting) return;
+    setSubmitting(true);
+    setDbError(null);
+    try {
+      const cleanName = nameInput.trim();
+      const cleanHandle = handleInput.trim();
+      localStorage.setItem('p_name', cleanName);
+      localStorage.setItem('p_handle', cleanHandle);
+
+      const pRef = ref(db, `rooms/${roomId}/participants/${participantId}`);
+      await fbSet(pRef, {
+        id: participantId,
+        name: cleanName,
+        handle: cleanHandle,
+        hasWon: false,
+        joinedAt: Date.now(),
+      });
+      setJoined(true);
+    } catch (err: any) {
+      setDbError(err?.message || 'Failed to join draw. Check Firebase rules.');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
-  const handleCastVote = (index: number) => {
+  const handleCastVote = async (index: number) => {
     setMyVote(index);
-    sendVoteRef.current?.({ participantId, optionIndex: index });
+    try {
+      const voteRef = ref(db, `rooms/${roomId}/poll/votes/${participantId}`);
+      await fbSet(voteRef, index);
+    } catch (err: any) {
+      setDbError(err?.message || 'Failed to submit vote.');
+    }
   };
 
+  // Host Handlers
   const eligibleParticipants = participants.filter((p) => !p.hasWon);
   const pastWinners = participants.filter((p) => p.hasWon);
 
@@ -226,7 +250,7 @@ export default function App() {
 
     let ticks = 0;
     const totalTicks = 28;
-    const interval = setInterval(() => {
+    const interval = setInterval(async () => {
       const randomCandidate =
         eligibleParticipants[Math.floor(Math.random() * eligibleParticipants.length)];
       setHighlightedName(randomCandidate.name);
@@ -242,41 +266,53 @@ export default function App() {
         setCurrentWinner(winner);
         setIsDrawing(false);
 
-        setParticipants((prev) =>
-          prev.map((p) => (p.id === winner.id ? { ...p, hasWon: true } : p))
-        );
+        const winnerRef = ref(db, `rooms/${roomId}/participants/${winner.id}`);
+        await update(winnerRef, { hasWon: true });
 
         confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
       }
     }, 80);
   };
 
-  const resetWinners = () => {
-    setParticipants((prev) => prev.map((p) => ({ ...p, hasWon: false })));
+  const resetWinners = async () => {
+    const updates: Record<string, any> = {};
+    participants.forEach((p) => {
+      updates[`rooms/${roomId}/participants/${p.id}/hasWon`] = false;
+    });
+    if (Object.keys(updates).length > 0) {
+      await update(ref(db), updates);
+    }
     setCurrentWinner(null);
   };
 
-  const clearAllData = () => {
-    if (!window.confirm('Clear all participants, winners, and votes?')) return;
+  const clearAllData = async () => {
+    if (!window.confirm('Clear all participants, winners, and votes for this room?')) return;
+    await remove(ref(db, `rooms/${roomId}`));
+    await idbSet(`meetup_participants_${roomId}`, []);
+    await idbSet(`meetup_poll_${roomId}`, DEFAULT_POLL);
     setParticipants([]);
     setCurrentWinner(null);
-    setPoll((prev) => ({ ...prev, votes: {} }));
-    set('meetup_participants', []);
+    setPoll(DEFAULT_POLL);
   };
 
-  const startPoll = () => {
+  const startPoll = async () => {
     const cleanedOptions = draftOptions
       .split('\n')
       .map((o) => o.trim())
       .filter(Boolean);
     if (!draftQuestion.trim() || cleanedOptions.length < 2) return;
 
-    setPoll({
+    const newPoll: Poll = {
       active: true,
       question: draftQuestion.trim(),
       options: cleanedOptions,
       votes: {},
-    });
+    };
+    await fbSet(ref(db, `rooms/${roomId}/poll`), newPoll);
+  };
+
+  const closePoll = async () => {
+    await update(ref(db, `rooms/${roomId}/poll`), { active: false });
   };
 
   const handleExportParticipants = () => {
@@ -306,6 +342,9 @@ export default function App() {
     downloadCSV(`meetup-poll-${roomId}.csv`, rows);
   };
 
+  // ==========================================
+  // VIEW 1: PARTICIPANT MOBILE VIEW
+  // ==========================================
   if (isParticipant) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-slate-950">
@@ -315,14 +354,25 @@ export default function App() {
               Room: {roomId}
             </span>
             <span className="flex items-center gap-1.5 text-xs text-slate-400">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  connectedToHost || peerCount > 0 ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'
-                }`}
-              />
-              {connectedToHost || peerCount > 0 ? 'Connected to Stage' : 'Connecting P2P...'}
+              {isConnected ? (
+                <>
+                  <Wifi className="w-3.5 h-3.5 text-emerald-400" />
+                  <span className="text-emerald-300">Live Connected</span>
+                </>
+              ) : (
+                <>
+                  <WifiOff className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
+                  <span>Connecting...</span>
+                </>
+              )}
             </span>
           </div>
+
+          {dbError && (
+            <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300">
+              Database error: {dbError}
+            </div>
+          )}
 
           {!joined ? (
             <form onSubmit={handleParticipantSubmit} className="space-y-4">
@@ -355,9 +405,10 @@ export default function App() {
               </div>
               <button
                 type="submit"
-                className="w-full py-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 font-semibold text-white transition"
+                disabled={submitting}
+                className="w-full py-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 font-semibold text-white transition"
               >
-                Enter Raffle
+                {submitting ? 'Joining...' : 'Enter Raffle'}
               </button>
             </form>
           ) : (
@@ -370,16 +421,17 @@ export default function App() {
                 </div>
               </div>
 
-              {hostPoll?.active ? (
+              {poll.active ? (
                 <div className="space-y-3 pt-2 border-t border-slate-800">
                   <span className="text-xs font-semibold uppercase tracking-wider text-indigo-400">
                     Live Poll
                   </span>
-                  <h2 className="text-lg font-bold text-white">{hostPoll.question}</h2>
+                  <h2 className="text-lg font-bold text-white">{poll.question}</h2>
                   <div className="space-y-2">
-                    {hostPoll.options.map((opt, idx) => (
+                    {poll.options.map((opt, idx) => (
                       <button
                         key={idx}
+                        type="button"
                         onClick={() => handleCastVote(idx)}
                         className={`w-full text-left px-4 py-3 rounded-xl border transition font-medium ${
                           myVote === idx
@@ -399,6 +451,7 @@ export default function App() {
               )}
 
               <button
+                type="button"
                 onClick={() => setJoined(false)}
                 className="w-full text-xs text-slate-500 hover:text-slate-300"
               >
@@ -411,19 +464,23 @@ export default function App() {
     );
   }
 
+  // ==========================================
+  // VIEW 2: HOST PROJECTOR / STAGE VIEW
+  // ==========================================
   const joinUrl = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
   const totalVotes = Object.keys(poll.votes).length;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-6 md:p-10">
       <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8">
+        {/* LEFT COLUMN */}
         <div className="lg:col-span-4 space-y-6">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 text-center space-y-4">
             <h2 className="text-lg font-bold text-white">Scan to Join & Vote</h2>
             <div className="bg-white p-4 rounded-xl inline-block">
               <QRCodeSVG value={joinUrl} size={190} />
             </div>
-            <div className="text-xs text-slate-400 break-all bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+            <div className="text-xs text-slate-400 break-all bg-slate-950 p-2.5 rounded-lg border border-slate-800 select-all">
               {joinUrl}
             </div>
             <div className="flex justify-center gap-4 text-xs text-slate-400 pt-1">
@@ -431,9 +488,17 @@ export default function App() {
                 <Users className="w-4 h-4 text-indigo-400" /> {participants.length} Registered
               </span>
               <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-emerald-400" /> {peerCount} Live Peers
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    isConnected ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'
+                  }`}
+                />
+                {isConnected ? 'Firebase Live' : 'Offline Cache'}
               </span>
             </div>
+            {dbError && (
+              <p className="text-xs text-rose-400 bg-rose-500/10 p-2 rounded-lg">{dbError}</p>
+            )}
           </div>
 
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5">
@@ -444,6 +509,7 @@ export default function App() {
               <div className="flex items-center gap-3">
                 {participants.length > 0 && (
                   <button
+                    type="button"
                     onClick={handleExportParticipants}
                     title="Export Participants & Winners to CSV"
                     className="text-xs text-emerald-400 hover:text-emerald-300 flex items-center gap-1"
@@ -452,6 +518,7 @@ export default function App() {
                   </button>
                 )}
                 <button
+                  type="button"
                   onClick={clearAllData}
                   title="Reset everything"
                   className="text-xs text-rose-400 hover:text-rose-300 flex items-center gap-1"
@@ -490,12 +557,13 @@ export default function App() {
           </div>
         </div>
 
+        {/* RIGHT COLUMN */}
         <div className="lg:col-span-8 space-y-6">
           <div className="flex gap-3 bg-slate-900 p-1.5 rounded-xl border border-slate-800 w-fit">
             <button
               type="button"
               onClick={() => setActiveTab('raffle')}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition cursor-pointer ${
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition ${
                 activeTab === 'raffle'
                   ? 'bg-indigo-600 text-white'
                   : 'text-slate-400 hover:text-white'
@@ -506,7 +574,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveTab('poll')}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition cursor-pointer ${
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition ${
                 activeTab === 'poll'
                   ? 'bg-indigo-600 text-white'
                   : 'text-slate-400 hover:text-white'
@@ -602,7 +670,7 @@ export default function App() {
                   {poll.active && (
                     <button
                       type="button"
-                      onClick={() => setPoll((p) => ({ ...p, active: false }))}
+                      onClick={closePoll}
                       className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-sm text-slate-300"
                     >
                       Close Poll
