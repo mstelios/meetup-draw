@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { joinRoom } from 'trystero/torrent';
+import { joinRoom } from 'trystero/nostr';
 import { get, set } from 'idb-keyval';
 import { QRCodeSVG } from 'qrcode.react';
 import confetti from 'canvas-confetti';
@@ -29,7 +29,13 @@ interface Poll {
   votes: Record<string, number>;
 }
 
-const APP_ID = 'meetup-local-first-draw-v1';
+const APP_ID = 'meetup-local-first-draw-v3';
+const NOSTR_RELAYS = [
+  'wss://relay.damus.io',
+  'wss://nos.lol',
+  'wss://relay.nostr.band',
+  'wss://nostr.wine',
+];
 
 function downloadCSV(filename: string, rows: string[][]) {
   const csvContent = rows
@@ -94,6 +100,8 @@ export default function App() {
   const sendJoinRef = useRef<any>(null);
   const sendVoteRef = useRef<any>(null);
   const broadcastStateRef = useRef<any>(null);
+  const pollRef = useRef<Poll>(poll);
+  pollRef.current = poll;
 
   useEffect(() => {
     if (isParticipant) return;
@@ -123,7 +131,7 @@ export default function App() {
   }, [poll, isParticipant]);
 
   useEffect(() => {
-    const room = joinRoom({ appId: APP_ID }, roomId);
+    const room = joinRoom({ appId: APP_ID, relayUrls: NOSTR_RELAYS }, roomId);
     const [sendJoin, getJoin] = room.makeAction('join');
     const [sendVote, getVote] = room.makeAction('vote');
     const [broadcastState, getState] = room.makeAction('state');
@@ -142,7 +150,7 @@ export default function App() {
           sendJoin({ id: participantId, name: savedName, handle: savedHandle || '' }, peerId);
         }
       } else {
-        broadcastState({ poll }, peerId);
+        broadcastState({ poll: pollRef.current }, peerId);
       }
     });
 
@@ -228,8 +236,7 @@ export default function App() {
         clearInterval(interval);
         const array = new Uint32Array(1);
         window.crypto.getRandomValues(array);
-        const winnerIndex = array[0] % eligibleParticipants.length;
-        const winner = eligibleParticipants[winnerIndex];
+        const winner = eligibleParticipants[array[0] % eligibleParticipants.length];
 
         setHighlightedName(null);
         setCurrentWinner(winner);
@@ -254,6 +261,7 @@ export default function App() {
     setParticipants([]);
     setCurrentWinner(null);
     setPoll((prev) => ({ ...prev, votes: {} }));
+    set('meetup_participants', []);
   };
 
   const startPoll = () => {
@@ -485,8 +493,9 @@ export default function App() {
         <div className="lg:col-span-8 space-y-6">
           <div className="flex gap-3 bg-slate-900 p-1.5 rounded-xl border border-slate-800 w-fit">
             <button
+              type="button"
               onClick={() => setActiveTab('raffle')}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition ${
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition cursor-pointer ${
                 activeTab === 'raffle'
                   ? 'bg-indigo-600 text-white'
                   : 'text-slate-400 hover:text-white'
@@ -495,8 +504,9 @@ export default function App() {
               <Trophy className="w-4 h-4" /> Raffle Draw
             </button>
             <button
+              type="button"
               onClick={() => setActiveTab('poll')}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition ${
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition cursor-pointer ${
                 activeTab === 'poll'
                   ? 'bg-indigo-600 text-white'
                   : 'text-slate-400 hover:text-white'
@@ -540,6 +550,7 @@ export default function App() {
               )}
 
               <button
+                type="button"
                 onClick={runDraw}
                 disabled={eligibleParticipants.length === 0 || isDrawing}
                 className="px-8 py-4 rounded-2xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-lg font-bold text-white shadow-lg shadow-indigo-600/20 transition"
@@ -553,6 +564,7 @@ export default function App() {
                     Previous winners excluded: <strong>{pastWinners.length}</strong>
                   </span>
                   <button
+                    type="button"
                     onClick={resetWinners}
                     className="flex items-center gap-1 text-indigo-400 hover:text-indigo-300"
                   >
@@ -581,6 +593,7 @@ export default function App() {
                 />
                 <div className="flex gap-3">
                   <button
+                    type="button"
                     onClick={startPoll}
                     className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 font-semibold text-sm text-white"
                   >
@@ -588,6 +601,7 @@ export default function App() {
                   </button>
                   {poll.active && (
                     <button
+                      type="button"
                       onClick={() => setPoll((p) => ({ ...p, active: false }))}
                       className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-sm text-slate-300"
                     >
@@ -604,6 +618,7 @@ export default function App() {
                     <div className="flex items-center gap-4">
                       <span className="text-sm text-slate-400">{totalVotes} total votes</span>
                       <button
+                        type="button"
                         onClick={handleExportPoll}
                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-emerald-400"
                       >
