@@ -1,14 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { initializeApp } from 'firebase/app';
-import {
-  getDatabase,
-  ref,
-  set as fbSet,
-  onValue,
-  remove,
-  update,
-} from 'firebase/database';
-import { get as idbGet, set as idbSet } from 'idb-keyval';
+import { getDatabase, ref, onValue, set as fbSet, update, remove } from 'firebase/database';
+import { get, set as idbSet } from 'idb-keyval';
 import { QRCodeSVG } from 'qrcode.react';
 import confetti from 'canvas-confetti';
 import {
@@ -22,6 +15,7 @@ import {
   Download,
   Wifi,
   WifiOff,
+  Award,
 } from 'lucide-react';
 
 const firebaseConfig = {
@@ -32,7 +26,6 @@ const firebaseConfig = {
   storageBucket: "meetup-draw-3b7b7.firebasestorage.app",
   messagingSenderId: "146187800604",
   appId: "1:146187800604:web:cb626b0ac6ce2934338fd9",
-  measurementId: "G-5NX8XPK50P"
 };
 
 const app = initializeApp(firebaseConfig);
@@ -46,19 +39,20 @@ interface Participant {
   joinedAt: number;
 }
 
+interface WinnerAnnouncement {
+  id: string;
+  name: string;
+  handle: string;
+  drawnAt: number;
+}
+
 interface Poll {
   active: boolean;
+  showResults: boolean;
   question: string;
   options: string[];
   votes: Record<string, number>;
 }
-
-const DEFAULT_POLL: Poll = {
-  active: false,
-  question: 'Which topic should we cover next meetup?',
-  options: ['AI & Local LLMs', 'WebAssembly & Rust', 'System Design', 'DevOps & Cloud'],
-  votes: {},
-};
 
 function downloadCSV(filename: string, rows: string[][]) {
   const csvContent = rows
@@ -89,17 +83,24 @@ export default function App() {
     return fresh;
   });
 
+  const [connected, setConnected] = useState(false);
+  const [dbError, setDbError] = useState<string | null>(null);
+
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [poll, setPoll] = useState<Poll>(DEFAULT_POLL);
+  const [poll, setPoll] = useState<Poll>({
+    active: false,
+    showResults: false,
+    question: 'Which topic should we cover next meetup?',
+    options: ['AI & Local LLMs', 'WebAssembly & Rust', 'System Design', 'DevOps & Cloud'],
+    votes: {},
+  });
+  const [latestWinner, setLatestWinner] = useState<WinnerAnnouncement | null>(null);
   const [activeTab, setActiveTab] = useState<'raffle' | 'poll'>('raffle');
   const [isDrawing, setIsDrawing] = useState(false);
   const [highlightedName, setHighlightedName] = useState<string | null>(null);
-  const [currentWinner, setCurrentWinner] = useState<Participant | null>(null);
-  const [isConnected, setIsConnected] = useState(false);
-  const [dbError, setDbError] = useState<string | null>(null);
 
-  const [draftQuestion, setDraftQuestion] = useState(DEFAULT_POLL.question);
-  const [draftOptions, setDraftOptions] = useState(DEFAULT_POLL.options.join('\n'));
+  const [draftQuestion, setDraftQuestion] = useState(poll.question);
+  const [draftOptions, setDraftOptions] = useState(poll.options.join('\n'));
 
   const [participantId] = useState(() => {
     let id = localStorage.getItem('participant_id');
@@ -112,48 +113,47 @@ export default function App() {
   const [nameInput, setNameInput] = useState(() => localStorage.getItem('p_name') || '');
   const [handleInput, setHandleInput] = useState(() => localStorage.getItem('p_handle') || '');
   const [joined, setJoined] = useState(false);
-  const [myVote, setMyVote] = useState<number | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+  const [celebratedWinnerId, setCelebratedWinnerId] = useState<string | null>(null);
 
   // Monitor Firebase connection status
   useEffect(() => {
-    const connectedRef = ref(db, '.info/connected');
-    const unsub = onValue(connectedRef, (snap) => {
-      setIsConnected(Boolean(snap.val()));
+    const connRef = ref(db, '.info/connected');
+    return onValue(connRef, (snap) => {
+      setConnected(Boolean(snap.val()));
     });
-    return () => unsub();
   }, []);
 
-  // Load local-first IndexedDB cache immediately on Host boot
+  // Load local IndexedDB fallback on Host boot
   useEffect(() => {
     if (isParticipant) return;
-    idbGet(`meetup_participants_${roomId}`).then((cached) => {
-      if (Array.isArray(cached) && cached.length > 0) setParticipants(cached);
+    get(`meetup_participants_${roomId}`).then((data) => {
+      if (data) setParticipants(data);
     });
-    idbGet(`meetup_poll_${roomId}`).then((cached) => {
-      if (cached) {
-        setPoll(cached);
-        setDraftQuestion(cached.question || DEFAULT_POLL.question);
-        setDraftOptions((cached.options || DEFAULT_POLL.options).join('\n'));
+    get(`meetup_poll_${roomId}`).then((data) => {
+      if (data) {
+        setPoll(data);
+        setDraftQuestion(data.question);
+        setDraftOptions(data.options.join('\n'));
       }
     });
   }, [isParticipant, roomId]);
 
-  // Subscribe to Firebase Realtime Database for Room Participants & Poll
+  // Subscribe to Firebase Realtime Database
   useEffect(() => {
     const participantsRef = ref(db, `rooms/${roomId}/participants`);
     const unsubParticipants = onValue(
       participantsRef,
-      (snapshot) => {
+      (snap) => {
         setDbError(null);
-        const val = snapshot.val();
-        if (!val) {
-          setParticipants([]);
-          if (!isParticipant) idbSet(`meetup_participants_${roomId}`, []);
-          return;
-        }
-        const list: Participant[] = Object.values(val);
-        list.sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
+        const val = snap.val() || {};
+        const list: Participant[] = Object.entries(val).map(([id, item]: [string, any]) => ({
+          id,
+          name: item.name || 'Anonymous',
+          handle: item.handle || '',
+          hasWon: Boolean(item.hasWon),
+          joinedAt: item.joinedAt || Date.now(),
+        }));
+        list.sort((a, b) => a.joinedAt - b.joinedAt);
         setParticipants(list);
         if (!isParticipant) {
           idbSet(`meetup_participants_${roomId}`, list);
@@ -161,81 +161,92 @@ export default function App() {
           setJoined(true);
         }
       },
-      (err) => {
-        setDbError(err.message);
-      }
+      (err) => setDbError(err.message)
     );
 
     const pollRef = ref(db, `rooms/${roomId}/poll`);
     const unsubPoll = onValue(
       pollRef,
-      (snapshot) => {
-        const val = snapshot.val();
-        if (!val) {
-          setPoll((prev) => ({ ...prev, active: false, votes: {} }));
-          return;
-        }
-        const loadedPoll: Poll = {
-          active: Boolean(val.active),
-          question: val.question || DEFAULT_POLL.question,
-          options: Array.isArray(val.options) ? val.options : DEFAULT_POLL.options,
-          votes: val.votes || {},
-        };
-        setPoll(loadedPoll);
-        if (!isParticipant) {
-          idbSet(`meetup_poll_${roomId}`, loadedPoll);
-        } else if (loadedPoll.votes[participantId] !== undefined) {
-          setMyVote(loadedPoll.votes[participantId]);
+      (snap) => {
+        const val = snap.val();
+        if (val) {
+          const syncedPoll: Poll = {
+            active: Boolean(val.active),
+            showResults: Boolean(val.showResults),
+            question: val.question || '',
+            options: Array.isArray(val.options) ? val.options : [],
+            votes: val.votes || {},
+          };
+          setPoll(syncedPoll);
+          if (!isParticipant) {
+            idbSet(`meetup_poll_${roomId}`, syncedPoll);
+          }
         } else {
-          setMyVote(null);
+          setPoll((prev) => ({ ...prev, active: false, showResults: false, votes: {} }));
         }
       },
-      (err) => {
-        setDbError(err.message);
-      }
+      (err) => setDbError(err.message)
+    );
+
+    const winnerRef = ref(db, `rooms/${roomId}/winner`);
+    const unsubWinner = onValue(
+      winnerRef,
+      (snap) => {
+        const val = snap.val();
+        setLatestWinner(val || null);
+      },
+      (err) => setDbError(err.message)
     );
 
     return () => {
       unsubParticipants();
       unsubPoll();
+      unsubWinner();
     };
   }, [roomId, isParticipant, participantId]);
+
+  // Trigger confetti on participant's own phone when they win!
+  useEffect(() => {
+    if (
+      isParticipant &&
+      latestWinner &&
+      latestWinner.id === participantId &&
+      celebratedWinnerId !== latestWinner.drawnAt.toString()
+    ) {
+      setCelebratedWinnerId(latestWinner.drawnAt.toString());
+      confetti({ particleCount: 150, spread: 90, origin: { y: 0.6 } });
+    }
+  }, [isParticipant, latestWinner, participantId, celebratedWinnerId]);
 
   // Participant Handlers
   const handleParticipantSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!nameInput.trim() || submitting) return;
-    setSubmitting(true);
-    setDbError(null);
-    try {
-      const cleanName = nameInput.trim();
-      const cleanHandle = handleInput.trim();
-      localStorage.setItem('p_name', cleanName);
-      localStorage.setItem('p_handle', cleanHandle);
+    if (!nameInput.trim()) return;
+    const cleanName = nameInput.trim();
+    const cleanHandle = handleInput.trim();
+    localStorage.setItem('p_name', cleanName);
+    localStorage.setItem('p_handle', cleanHandle);
 
-      const pRef = ref(db, `rooms/${roomId}/participants/${participantId}`);
-      await fbSet(pRef, {
-        id: participantId,
+    try {
+      await fbSet(ref(db, `rooms/${roomId}/participants/${participantId}`), {
         name: cleanName,
         handle: cleanHandle,
         hasWon: false,
         joinedAt: Date.now(),
       });
       setJoined(true);
+      setDbError(null);
     } catch (err: any) {
-      setDbError(err?.message || 'Failed to join draw. Check Firebase rules.');
-    } finally {
-      setSubmitting(false);
+      setDbError(err.message || 'Failed to submit entry');
     }
   };
 
   const handleCastVote = async (index: number) => {
-    setMyVote(index);
     try {
-      const voteRef = ref(db, `rooms/${roomId}/poll/votes/${participantId}`);
-      await fbSet(voteRef, index);
+      await fbSet(ref(db, `rooms/${roomId}/poll/votes/${participantId}`), index);
+      setDbError(null);
     } catch (err: any) {
-      setDbError(err?.message || 'Failed to submit vote.');
+      setDbError(err.message || 'Failed to submit vote');
     }
   };
 
@@ -246,10 +257,9 @@ export default function App() {
   const runDraw = () => {
     if (eligibleParticipants.length === 0 || isDrawing) return;
     setIsDrawing(true);
-    setCurrentWinner(null);
 
     let ticks = 0;
-    const totalTicks = 28;
+    const totalTicks = 25;
     const interval = setInterval(async () => {
       const randomCandidate =
         eligibleParticipants[Math.floor(Math.random() * eligibleParticipants.length)];
@@ -263,11 +273,17 @@ export default function App() {
         const winner = eligibleParticipants[array[0] % eligibleParticipants.length];
 
         setHighlightedName(null);
-        setCurrentWinner(winner);
         setIsDrawing(false);
 
-        const winnerRef = ref(db, `rooms/${roomId}/participants/${winner.id}`);
-        await update(winnerRef, { hasWon: true });
+        const announcement: WinnerAnnouncement = {
+          id: winner.id,
+          name: winner.name,
+          handle: winner.handle,
+          drawnAt: Date.now(),
+        };
+
+        await update(ref(db, `rooms/${roomId}/participants/${winner.id}`), { hasWon: true });
+        await fbSet(ref(db, `rooms/${roomId}/winner`), announcement);
 
         confetti({ particleCount: 120, spread: 80, origin: { y: 0.6 } });
       }
@@ -279,20 +295,18 @@ export default function App() {
     participants.forEach((p) => {
       updates[`rooms/${roomId}/participants/${p.id}/hasWon`] = false;
     });
-    if (Object.keys(updates).length > 0) {
-      await update(ref(db), updates);
-    }
-    setCurrentWinner(null);
+    updates[`rooms/${roomId}/winner`] = null;
+    await update(ref(db), updates);
   };
 
   const clearAllData = async () => {
-    if (!window.confirm('Clear all participants, winners, and votes for this room?')) return;
+    if (!window.confirm('Clear all participants, winners, and votes?')) return;
     await remove(ref(db, `rooms/${roomId}`));
     await idbSet(`meetup_participants_${roomId}`, []);
-    await idbSet(`meetup_poll_${roomId}`, DEFAULT_POLL);
+    await idbSet(`meetup_poll_${roomId}`, null);
     setParticipants([]);
-    setCurrentWinner(null);
-    setPoll(DEFAULT_POLL);
+    setLatestWinner(null);
+    setPoll((prev) => ({ ...prev, active: false, showResults: false, votes: {} }));
   };
 
   const startPoll = async () => {
@@ -304,6 +318,7 @@ export default function App() {
 
     const newPoll: Poll = {
       active: true,
+      showResults: false,
       question: draftQuestion.trim(),
       options: cleanedOptions,
       votes: {},
@@ -312,7 +327,11 @@ export default function App() {
   };
 
   const closePoll = async () => {
-    await update(ref(db, `rooms/${roomId}/poll`), { active: false });
+    await update(ref(db, `rooms/${roomId}/poll`), { active: false, showResults: true });
+  };
+
+  const toggleShareResults = async () => {
+    await update(ref(db, `rooms/${roomId}/poll`), { showResults: !poll.showResults });
   };
 
   const handleExportParticipants = () => {
@@ -346,18 +365,24 @@ export default function App() {
   // VIEW 1: PARTICIPANT MOBILE VIEW
   // ==========================================
   if (isParticipant) {
+    const myVote = poll.votes?.[participantId];
+    const hasVoted = typeof myVote === 'number';
+    const totalVotes = Object.keys(poll.votes || {}).length;
+    const isMeWinner = latestWinner && latestWinner.id === participantId;
+    const canSeePollResults = poll.showResults || hasVoted;
+
     return (
       <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-slate-950">
-        <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
-          <div className="flex items-center justify-between mb-6">
+        <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-5">
+          <div className="flex items-center justify-between">
             <span className="text-xs font-mono uppercase tracking-wider px-2.5 py-1 rounded-full bg-indigo-500/20 text-indigo-300">
               Room: {roomId}
             </span>
             <span className="flex items-center gap-1.5 text-xs text-slate-400">
-              {isConnected ? (
+              {connected ? (
                 <>
                   <Wifi className="w-3.5 h-3.5 text-emerald-400" />
-                  <span className="text-emerald-300">Live Connected</span>
+                  <span className="text-emerald-400">Live</span>
                 </>
               ) : (
                 <>
@@ -369,8 +394,28 @@ export default function App() {
           </div>
 
           {dbError && (
-            <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300">
-              Database error: {dbError}
+            <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300">
+              {dbError}
+            </div>
+          )}
+
+          {/* LIVE WINNER BANNER ON PARTICIPANT PHONE */}
+          {latestWinner && (
+            <div
+              className={`p-4 rounded-2xl border text-center space-y-1 transition-all ${
+                isMeWinner
+                  ? 'bg-gradient-to-br from-amber-500/20 via-indigo-500/20 to-emerald-500/20 border-amber-400 shadow-lg shadow-amber-500/10'
+                  : 'bg-slate-950 border-amber-500/40'
+              }`}
+            >
+              <div className="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-amber-300">
+                <Award className="w-4 h-4" />
+                {isMeWinner ? '🎉 Congratulations! You Won!' : 'Latest Draw Winner'}
+              </div>
+              <p className="text-xl font-extrabold text-white">{latestWinner.name}</p>
+              {latestWinner.handle && (
+                <p className="text-xs text-indigo-300">{latestWinner.handle}</p>
+              )}
             </div>
           )}
 
@@ -378,7 +423,7 @@ export default function App() {
             <form onSubmit={handleParticipantSubmit} className="space-y-4">
               <h1 className="text-2xl font-bold text-white">Join the Meetup Draw</h1>
               <p className="text-sm text-slate-400">
-                Enter your details below to enter the raffle and participate in live polls.
+                Enter your details below to enter the raffle and vote in live polls.
               </p>
               <div>
                 <label className="block text-sm font-medium text-slate-300 mb-1">Full Name *</label>
@@ -405,55 +450,85 @@ export default function App() {
               </div>
               <button
                 type="submit"
-                disabled={submitting}
-                className="w-full py-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 font-semibold text-white transition"
+                className="w-full py-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 font-semibold text-white transition"
               >
-                {submitting ? 'Joining...' : 'Enter Raffle'}
+                Enter Raffle
               </button>
             </form>
           ) : (
-            <div className="space-y-6">
-              <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center gap-3">
-                <CheckCircle2 className="text-emerald-400 shrink-0" />
+            <div className="space-y-5">
+              <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center gap-3">
+                <CheckCircle2 className="text-emerald-400 shrink-0 w-5 h-5" />
                 <div>
-                  <p className="font-semibold text-emerald-200">You're in the draw, {nameInput}!</p>
-                  <p className="text-xs text-emerald-300/80">Keep this tab open to vote in polls.</p>
+                  <p className="font-semibold text-sm text-emerald-200">
+                    Registered: {nameInput}
+                  </p>
+                  <p className="text-xs text-emerald-300/80">
+                    Results update automatically on this screen.
+                  </p>
                 </div>
               </div>
 
-              {poll.active ? (
-                <div className="space-y-3 pt-2 border-t border-slate-800">
-                  <span className="text-xs font-semibold uppercase tracking-wider text-indigo-400">
-                    Live Poll
-                  </span>
+              {/* POLL VOTING & LIVE RESULTS ON PHONE */}
+              {(poll.active || poll.showResults) && poll.options.length > 0 ? (
+                <div className="space-y-3 pt-3 border-t border-slate-800">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-indigo-400">
+                      {poll.active ? 'Live Poll' : 'Poll Results'}
+                    </span>
+                    <span className="text-xs text-slate-400">{totalVotes} votes</span>
+                  </div>
                   <h2 className="text-lg font-bold text-white">{poll.question}</h2>
-                  <div className="space-y-2">
-                    {poll.options.map((opt, idx) => (
-                      <button
-                        key={idx}
-                        type="button"
-                        onClick={() => handleCastVote(idx)}
-                        className={`w-full text-left px-4 py-3 rounded-xl border transition font-medium ${
-                          myVote === idx
-                            ? 'bg-indigo-600 border-indigo-400 text-white'
-                            : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-600'
-                        }`}
-                      >
-                        {opt}
-                      </button>
-                    ))}
+
+                  <div className="space-y-2.5">
+                    {poll.options.map((opt, idx) => {
+                      const count = Object.values(poll.votes || {}).filter((v) => v === idx).length;
+                      const pct = totalVotes > 0 ? Math.round((count / totalVotes) * 100) : 0;
+                      const isSelected = myVote === idx;
+
+                      return (
+                        <button
+                          key={idx}
+                          disabled={!poll.active}
+                          onClick={() => handleCastVote(idx)}
+                          className={`w-full text-left p-3.5 rounded-xl border transition relative overflow-hidden ${
+                            isSelected
+                              ? 'border-indigo-400 bg-indigo-950/50 text-white'
+                              : 'border-slate-800 bg-slate-950 text-slate-200 hover:border-slate-700'
+                          } ${!poll.active ? 'cursor-default' : ''}`}
+                        >
+                          {canSeePollResults && (
+                            <div
+                              className="absolute inset-y-0 left-0 bg-indigo-500/20 transition-all duration-500"
+                              style={{ width: `${pct}%` }}
+                            />
+                          )}
+                          <div className="relative flex items-center justify-between gap-2">
+                            <span className="font-medium text-sm">
+                              {opt} {isSelected && '✓'}
+                            </span>
+                            {canSeePollResults && (
+                              <span className="text-xs font-semibold text-indigo-300 shrink-0">
+                                {count} ({pct}%)
+                              </span>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               ) : (
-                <p className="text-center text-sm text-slate-500 py-4">
-                  Waiting for host to launch a poll or start the draw...
-                </p>
+                !latestWinner && (
+                  <p className="text-center text-sm text-slate-500 py-3">
+                    Waiting for host to launch a poll or start the draw...
+                  </p>
+                )
               )}
 
               <button
-                type="button"
                 onClick={() => setJoined(false)}
-                className="w-full text-xs text-slate-500 hover:text-slate-300"
+                className="w-full text-xs text-slate-500 hover:text-slate-300 pt-1"
               >
                 Edit my name / handle
               </button>
@@ -468,7 +543,7 @@ export default function App() {
   // VIEW 2: HOST PROJECTOR / STAGE VIEW
   // ==========================================
   const joinUrl = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
-  const totalVotes = Object.keys(poll.votes).length;
+  const totalVotes = Object.keys(poll.votes || {}).length;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 p-6 md:p-10">
@@ -480,7 +555,7 @@ export default function App() {
             <div className="bg-white p-4 rounded-xl inline-block">
               <QRCodeSVG value={joinUrl} size={190} />
             </div>
-            <div className="text-xs text-slate-400 break-all bg-slate-950 p-2.5 rounded-lg border border-slate-800 select-all">
+            <div className="text-xs text-slate-400 break-all bg-slate-950 p-2.5 rounded-lg border border-slate-800">
               {joinUrl}
             </div>
             <div className="flex justify-center gap-4 text-xs text-slate-400 pt-1">
@@ -490,10 +565,10 @@ export default function App() {
               <span className="flex items-center gap-1">
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    isConnected ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'
+                    connected ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'
                   }`}
                 />
-                {isConnected ? 'Firebase Live' : 'Offline Cache'}
+                {connected ? 'Firebase Synced' : 'Offline Cache'}
               </span>
             </div>
             {dbError && (
@@ -509,7 +584,6 @@ export default function App() {
               <div className="flex items-center gap-3">
                 {participants.length > 0 && (
                   <button
-                    type="button"
                     onClick={handleExportParticipants}
                     title="Export Participants & Winners to CSV"
                     className="text-xs text-emerald-400 hover:text-emerald-300 flex items-center gap-1"
@@ -518,7 +592,6 @@ export default function App() {
                   </button>
                 )}
                 <button
-                  type="button"
                   onClick={clearAllData}
                   title="Reset everything"
                   className="text-xs text-rose-400 hover:text-rose-300 flex items-center gap-1"
@@ -595,16 +668,16 @@ export default function App() {
                     {highlightedName}
                   </div>
                 </div>
-              ) : currentWinner ? (
+              ) : latestWinner ? (
                 <div className="space-y-3">
                   <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/20 text-amber-300 text-sm font-semibold">
-                    <Sparkles className="w-4 h-4" /> Winner!
+                    <Sparkles className="w-4 h-4" /> Winner Broadcasted to Phones!
                   </span>
                   <h1 className="text-4xl md:text-6xl font-extrabold text-white">
-                    {currentWinner.name}
+                    {latestWinner.name}
                   </h1>
-                  {currentWinner.handle && (
-                    <p className="text-xl text-indigo-300">{currentWinner.handle}</p>
+                  {latestWinner.handle && (
+                    <p className="text-xl text-indigo-300">{latestWinner.handle}</p>
                   )}
                 </div>
               ) : (
@@ -659,7 +732,7 @@ export default function App() {
                   placeholder="One option per line..."
                   className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm"
                 />
-                <div className="flex gap-3">
+                <div className="flex flex-wrap gap-3">
                   <button
                     type="button"
                     onClick={startPoll}
@@ -667,19 +740,28 @@ export default function App() {
                   >
                     {poll.active ? 'Update & Reset Votes' : 'Push Poll to Phones'}
                   </button>
+                  {(poll.active || poll.showResults) && (
+                    <button
+                      type="button"
+                      onClick={toggleShareResults}
+                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-sm text-indigo-300"
+                    >
+                      {poll.showResults ? 'Hide Live Tallies Before Voting' : 'Broadcast Results to All Phones'}
+                    </button>
+                  )}
                   {poll.active && (
                     <button
                       type="button"
                       onClick={closePoll}
-                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-sm text-slate-300"
+                      className="px-4 py-2.5 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/40 text-sm text-emerald-300"
                     >
-                      Close Poll
+                      Close Poll & Show Final Results
                     </button>
                   )}
                 </div>
               </div>
 
-              {poll.active && (
+              {(poll.active || poll.showResults) && (
                 <div className="pt-6 border-t border-slate-800 space-y-4">
                   <div className="flex justify-between items-center">
                     <h3 className="text-lg font-bold text-white">{poll.question}</h3>
@@ -696,7 +778,7 @@ export default function App() {
                   </div>
                   <div className="space-y-3">
                     {poll.options.map((option, idx) => {
-                      const count = Object.values(poll.votes).filter((v) => v === idx).length;
+                      const count = Object.values(poll.votes || {}).filter((v) => v === idx).length;
                       const pct = totalVotes > 0 ? Math.round((count / totalVotes) * 100) : 0;
                       return (
                         <div key={idx} className="space-y-1">
